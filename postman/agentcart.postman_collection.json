@@ -1,0 +1,351 @@
+{
+  "info": {
+    "_postman_id": "7fa128c9-a5e2-4bd3-8cfb-21d154ee2cb1",
+    "name": "AgentCart API",
+    "description": "Postman collection for AgentCart — AI shopping agent with deterministic ranking and PayPal Sandbox checkout.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "demoSession",
+      "value": "demo-postman-session-001",
+      "type": "string"
+    },
+    {
+      "key": "sessionId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "productId",
+      "value": "prod-laptop-northline-14",
+      "type": "string"
+    },
+    {
+      "key": "orderId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "paypalOrderId",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & System",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "health"]
+            }
+          }
+        },
+        {
+          "name": "Public Settings",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/settings/public",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "settings", "public"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Catalog & Products",
+      "item": [
+        {
+          "name": "List Products",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Demo-Session",
+                "value": "{{demoSession}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/products?limit=24&category=laptop",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products"],
+              "query": [
+                { "key": "limit", "value": "24" },
+                { "key": "category", "value": "laptop" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Product Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Demo-Session",
+                "value": "{{demoSession}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/{{productId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "{{productId}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "AI Shopping Agent",
+      "item": [
+        {
+          "name": "Agent Search (Extract & Rank)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Find me the best laptop for coding under ₹70,000 with at least 16 GB RAM.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/agent/search",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "agent", "search"]
+            }
+          }
+        },
+        {
+          "name": "Agent Follow-up Message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{sessionId}}\",\n  \"message\": \"Increase battery importance and exclude brand Northline.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/agent/message",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "agent", "message"]
+            }
+          }
+        },
+        {
+          "name": "Agent Rerank (Deterministic)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{sessionId}}\",\n  \"weights\": {\n    \"price\": 0.1,\n    \"performance\": 0.2,\n    \"battery\": 0.5,\n    \"display\": 0.1,\n    \"portability\": 0.1\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/agent/rerank",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "agent", "rerank"]
+            }
+          }
+        },
+        {
+          "name": "Agent Compare Products",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_ids\": [\"prod-laptop-northline-14\", \"prod-laptop-proair-14\"],\n  \"session_id\": \"{{sessionId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/agent/compare",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "agent", "compare"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sessions",
+      "item": [
+        {
+          "name": "Create Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "sessions"]
+            }
+          }
+        },
+        {
+          "name": "List Sessions",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "sessions"]
+            }
+          }
+        },
+        {
+          "name": "Get Session History",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions/{{sessionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "sessions", "{{sessionId}}"]
+            }
+          }
+        },
+        {
+          "name": "Get Session Recommendations",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/sessions/{{sessionId}}/recommendations",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "sessions", "{{sessionId}}", "recommendations"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Checkout & Payments",
+      "item": [
+        {
+          "name": "Create PayPal Order",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_id\": \"{{productId}}\",\n  \"session_id\": \"{{sessionId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/checkout/create-order",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "checkout", "create-order"]
+            }
+          }
+        },
+        {
+          "name": "Capture PayPal Order",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paypal_order_id\": \"{{paypalOrderId}}\",\n  \"session_id\": \"{{sessionId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/checkout/capture-order",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "checkout", "capture-order"]
+            }
+          }
+        },
+        {
+          "name": "Cancel Checkout Order",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paypal_order_id\": \"{{paypalOrderId}}\",\n  \"session_id\": \"{{sessionId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/checkout/cancel",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "checkout", "cancel"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
+        {
+          "name": "List Orders",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/orders",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "orders"]
+            }
+          }
+        },
+        {
+          "name": "Get Order Detail",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Demo-Session", "value": "{{demoSession}}" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/orders/{{orderId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "orders", "{{orderId}}"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
