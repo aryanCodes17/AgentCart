@@ -1,9 +1,12 @@
 import pytest
 from fastapi.testclient import TestClient
-
+import uuid
 from app.config import get_settings
 from app.main import app
+from sqlalchemy import select
 
+from app.db import SessionLocal
+from app.models import Order, PaymentAttempt
 
 @pytest.fixture()
 def client():
@@ -109,3 +112,531 @@ def test_checkout_cancel_requires_matching_owner_and_session(client: TestClient)
     )
     assert response.status_code == 404
 
+def test_checkout_cancel_rejected_while_capture_is_in_progress(client: TestClient):
+    # Create a valid session and product using the existing API.
+    test_suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-CAPTURE-{test_suffix}"
+    create_key = f"test-create-{test_suffix}"
+    capture_key = f"test-capture-{test_suffix}"
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    # Insert a representative order and an active capture attempt.
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=create_key,
+        )
+        db.add(order)
+        db.flush()
+
+        db.add(
+            PaymentAttempt(
+                order_id=order.id,
+                kind="capture",
+                status="started",
+                paypal_order_id=order.paypal_order_id,
+                idempotency_key=capture_key,
+            )
+        )
+        db.commit()
+
+    # Cancellation must not win against an active capture.
+    response = client.post(
+        "/api/checkout/cancel",
+        headers=HEADERS,
+        json={
+            "paypal_order_id":paypal_order_id,
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(
+                Order.paypal_order_id == paypal_order_id
+            )
+        )
+        assert saved_order is not None
+        assert saved_order.status != "cancelled"
+
+
+
+def test_checkout_capture_timeout_keeps_attempt_for_reconciliation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.routers import checkout as checkout_router
+    import httpx
+
+    test_suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-TIMEOUT-{test_suffix}"
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-create-{test_suffix}",
+        )
+        db.add(order)
+        db.commit()
+
+    class TimeoutPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def capture_order(self, paypal_order_id, request_id):
+            raise httpx.ReadTimeout("Simulated PayPal timeout")
+
+    monkeypatch.setattr(checkout_router, "PayPalClient", TimeoutPayPalClient)
+
+    response = client.post(
+        "/api/checkout/capture-order",
+        headers=HEADERS,
+        json={"paypal_order_id": paypal_order_id, "session_id": session_id},
+    )
+
+    assert response.status_code == 502
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(Order.paypal_order_id == paypal_order_id)
+        )
+        assert saved_order is not None
+        assert saved_order.status != "paid"
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "capture",
+            )
+        )
+        assert attempt is not None
+        assert attempt.status == "started"
+
+
+
+def test_checkout_recovers_when_paypal_says_order_already_captured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from app.routers import checkout as checkout_router
+    from app.services.paypal import PayPalError
+
+    test_suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-ALREADY-CAPTURED-{test_suffix}"
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-create-{test_suffix}",
+        )
+        db.add(order)
+        db.commit()
+
+    class AlreadyCapturedPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def capture_order(self, paypal_order_id, request_id):
+            raise PayPalError(
+                "PayPal reports this order was already captured.",
+                payload={
+                    "details": [
+                        {"issue": "ORDER_ALREADY_CAPTURED"}
+                    ]
+                },
+            )
+
+        async def get_order(self, paypal_order_id):
+            assert paypal_order_id == f"TEST-ALREADY-CAPTURED-{test_suffix}"
+            return {
+                "id": paypal_order_id,
+                "status": "COMPLETED",
+                "purchase_units": [
+                    {
+                        "payments": {
+                            "captures": [
+                                {"id": f"CAPTURE-{test_suffix}", "status": "COMPLETED"}
+                            ]
+                        }
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", AlreadyCapturedPayPalClient
+    )
+
+    response = client.post(
+        "/api/checkout/capture-order",
+        headers=HEADERS,
+        json={
+            "paypal_order_id": paypal_order_id,
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["duplicate"] is True
+    assert body["order"]["status"] == "paid"
+    assert body["order"]["paypal_capture_id"] == f"CAPTURE-{test_suffix}"
+    assert body["paypal_status"] == "COMPLETED"
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(Order.paypal_order_id == paypal_order_id)
+        )
+        assert saved_order is not None
+        assert saved_order.status == "paid"
+        assert saved_order.paypal_capture_id == f"CAPTURE-{test_suffix}"
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "capture",
+            )
+        )
+        assert attempt is not None
+        assert attempt.status == "succeeded"
+
+
+def test_checkout_reconciles_existing_capture_attempt(client, monkeypatch):
+    from app.routers import checkout as checkout_router
+
+    test_suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-RECONCILE-{test_suffix}"
+    capture_id = f"CAPTURE-{test_suffix}"
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-create-{test_suffix}",
+        )
+        db.add(order)
+        db.flush()
+
+        attempt = PaymentAttempt(
+            order_id=order.id,
+            kind="capture",
+            status="started",
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-capture-{test_suffix}",
+            error_message="Simulated timeout",
+        )
+        db.add(attempt)
+        db.commit()
+
+    class ReconciliationPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def get_order(self, requested_order_id):
+            assert requested_order_id == paypal_order_id
+            return {
+                "id": paypal_order_id,
+                "status": "COMPLETED",
+                "purchase_units": [
+                    {
+                        "payments": {
+                            "captures": [
+                                {
+                                    "id": capture_id,
+                                    "status": "COMPLETED",
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+
+        async def capture_order(self, paypal_order_id, request_id):
+            raise AssertionError(
+                "A new capture must not be initiated during reconciliation."
+            )
+
+    monkeypatch.setattr(
+        checkout_router,
+        "PayPalClient",
+        ReconciliationPayPalClient,
+    )
+
+    response = client.post(
+        "/api/checkout/capture-order",
+        headers=HEADERS,
+        json={
+            "paypal_order_id": paypal_order_id,
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["duplicate"] is True
+    assert body["order"]["status"] == "paid"
+    assert body["order"]["paypal_capture_id"] == capture_id
+    assert body["paypal_status"] == "COMPLETED"
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(
+                Order.paypal_order_id == paypal_order_id
+            )
+        )
+        assert saved_order is not None
+        assert saved_order.status == "paid"
+        assert saved_order.paypal_capture_id == capture_id
+
+        saved_attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "capture",
+            )
+        )
+        assert saved_attempt is not None
+        assert saved_attempt.status == "succeeded"
+
+
+
+def test_checkout_reconciliation_keeps_non_completed_capture_blocked(
+    client, monkeypatch
+):
+    from app.routers import checkout as checkout_router
+
+    suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-RECONCILE-APPROVED-{suffix}"
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-create-{suffix}",
+        )
+        db.add(order)
+        db.flush()
+        db.add(
+            PaymentAttempt(
+                order_id=order.id,
+                kind="capture",
+                status="started",
+                paypal_order_id=paypal_order_id,
+                idempotency_key=f"test-capture-{suffix}",
+            )
+        )
+        db.commit()
+
+    class ApprovedPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def get_order(self, requested_order_id):
+            return {"id": requested_order_id, "status": "APPROVED"}
+
+        async def capture_order(self, paypal_order_id, request_id):
+            raise AssertionError("Must not initiate a second capture.")
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", ApprovedPayPalClient
+    )
+
+    response = client.post(
+        "/api/checkout/capture-order",
+        headers=HEADERS,
+        json={
+            "paypal_order_id": paypal_order_id,
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]["code"]
+        == "paypal_capture_reconciliation_required"
+    )
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(Order.paypal_order_id == paypal_order_id)
+        )
+        assert saved_order is not None
+        assert saved_order.status != "paid"
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "capture",
+            )
+        )
+        assert attempt is not None
+        assert attempt.status == "started"
+
+
+
+def test_checkout_reconciliation_keeps_capture_blocked_when_paypal_unreachable(
+    client, monkeypatch
+):
+    import httpx
+    from app.routers import checkout as checkout_router
+
+    suffix = uuid.uuid4().hex
+    paypal_order_id = f"TEST-RECONCILE-ERROR-{suffix}"
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    with SessionLocal() as db:
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending_approval",
+            amount_inr=1000,
+            currency="INR",
+            paypal_amount=10.53,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            paypal_order_id=paypal_order_id,
+            idempotency_key=f"test-create-{suffix}",
+        )
+        db.add(order)
+        db.flush()
+        db.add(
+            PaymentAttempt(
+                order_id=order.id,
+                kind="capture",
+                status="started",
+                paypal_order_id=paypal_order_id,
+                idempotency_key=f"test-capture-{suffix}",
+            )
+        )
+        db.commit()
+
+    class UnreachablePayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def get_order(self, requested_order_id):
+            raise httpx.ReadTimeout("Simulated PayPal lookup timeout")
+
+        async def capture_order(self, paypal_order_id, request_id):
+            raise AssertionError("Must not initiate a second capture.")
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", UnreachablePayPalClient
+    )
+
+    response = client.post(
+        "/api/checkout/capture-order",
+        headers=HEADERS,
+        json={
+            "paypal_order_id": paypal_order_id,
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]["code"]
+        == "paypal_capture_reconciliation_required"
+    )
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(Order.paypal_order_id == paypal_order_id)
+        )
+        assert saved_order is not None
+        assert saved_order.status != "paid"
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "capture",
+            )
+        )
+        assert attempt is not None
+        assert attempt.status == "started"

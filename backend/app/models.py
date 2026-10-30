@@ -4,7 +4,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer,
+    Numeric, String, Text, UniqueConstraint, text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -151,8 +154,19 @@ class Order(Base):
 
 class PaymentAttempt(Base):
     __tablename__ = "payment_attempts"
-    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_payment_attempt_idempotency"),)
-
+    __table_args__ = (
+    UniqueConstraint(
+        "idempotency_key",
+        name="uq_payment_attempt_idempotency",
+    ),
+    Index(
+        "uq_one_started_capture_per_order",
+        "order_id",
+        unique=True,
+        sqlite_where=text("kind = 'capture' AND status = 'started'"),
+        postgresql_where=text("kind = 'capture' AND status = 'started'"),
+    ),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
     kind: Mapped[str] = mapped_column(String(24))

@@ -1,17 +1,37 @@
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+import httpx
 
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import current_owner
-from app.models import Order, PaymentAttempt, Product, ShoppingSession, new_id,OrderItem
-from app.schemas import CaptureOrderRequest, CreateOrderRequest, OrderOut, ProductOut
+from app.models import (
+    Order,
+    OrderItem,
+    PaymentAttempt,
+    Product,
+    ShoppingSession,
+    new_id,
+)
+from app.schemas import (
+    CaptureOrderRequest,
+    CreateOrderRequest,
+    OrderOut,
+    ProductOut,
+)
 from app.services.catalog import product_to_dict
-from app.services.paypal import PayPalClient, PayPalError, approval_url_from, capture_id_from, inr_to_paypal_amount
+from app.services.paypal import (
+    PayPalClient,
+    PayPalError,
+    approval_url_from,
+    capture_id_from,
+    inr_to_paypal_amount,
+)
 
 router = APIRouter(prefix="/api/checkout", tags=["checkout"])
-
 
 
 def _order_out(order: Order) -> OrderOut:
@@ -43,8 +63,6 @@ def _order_out(order: Order) -> OrderOut:
     )
 
 
-
-
 @router.post("/create-order")
 async def create_order(
     body: CreateOrderRequest,
@@ -56,7 +74,7 @@ async def create_order(
     if session is None or session.demo_owner_id != owner:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    # Support both multi-item carts and legacy single-product requests.
+    # Support multi-item carts and legacy single-product requests.
     requested_items = (
         [(item.product_id, item.quantity) for item in body.items]
         if body.items
@@ -66,7 +84,7 @@ async def create_order(
     products_and_quantities = []
     total_inr = 0.0
 
-    # Validate every product and calculate the total on the server.
+    # Validate products and calculate the total on the server.
     for product_id, quantity in requested_items:
         product = db.get(Product, product_id)
 
@@ -91,7 +109,7 @@ async def create_order(
         settings.paypal_inr_per_usd,
     )
 
-    # Keep product_id populated for compatibility with existing orders/API.
+    # Preserve product_id for compatibility with existing orders/API.
     first_product = products_and_quantities[0][0]
 
     order = Order(
@@ -208,16 +226,31 @@ async def capture_order(
     owner: str = Depends(current_owner),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    order = db.scalar(select(Order).where(Order.paypal_order_id == body.paypal_order_id))
-    if order is None or order.demo_owner_id != owner or order.session_id != body.session_id:
-        raise HTTPException(status_code=404, detail="Order not found for this demo session.")
+    order = db.scalar(
+        select(Order).where(Order.paypal_order_id == body.paypal_order_id)
+    )
+
+    if (
+        order is None
+        or order.demo_owner_id != owner
+        or order.session_id != body.session_id
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found for this demo session.",
+        )
 
     if order.status == "paid" and order.paypal_capture_id:
-        return {"order": _order_out(order), "duplicate": True, "sandbox": True}
+        return {
+            "order": _order_out(order),
+            "duplicate": True,
+            "sandbox": True,
+        }
 
     if order.status == "cancelled":
         raise HTTPException(status_code=409, detail="Order was cancelled.")
 
+    # Reconcile an earlier capture whose outcome is still unknown.
     existing = db.scalar(
         select(PaymentAttempt).where(
             PaymentAttempt.order_id == order.id,
@@ -225,31 +258,136 @@ async def capture_order(
             PaymentAttempt.status == "started",
         )
     )
+
     if existing:
-        raise HTTPException(status_code=409, detail="Capture already in progress.")
+        client = PayPalClient(settings)
+
+        try:
+            order_details = await client.get_order(body.paypal_order_id)
+            reconciled_capture_id = capture_id_from(order_details)
+
+            if (
+                order_details.get("status") == "COMPLETED"
+                and reconciled_capture_id
+            ):
+                order.status = "paid"
+                order.paypal_status = "COMPLETED"
+                order.paypal_capture_id = reconciled_capture_id
+                existing.status = "succeeded"
+                existing.error_message = None
+                db.commit()
+                db.refresh(order)
+
+                return {
+                    "order": _order_out(order),
+                    "duplicate": True,
+                    "sandbox": True,
+                    "paypal_status": "COMPLETED",
+                }
+
+            existing.error_message = (
+                "Reconciliation did not confirm a completed capture. "
+                "Another capture is blocked pending verification."
+            )
+            db.commit()
+
+        except Exception:
+            # Do not allow another capture when PayPal cannot be checked.
+            db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "paypal_capture_reconciliation_required",
+                "message": (
+                    "The previous capture outcome is still unresolved. "
+                    "No new capture was initiated. Verify the payment "
+                    "status with PayPal before retrying."
+                ),
+            },
+        )
 
     idempotency = f"capture-{new_id()}"
+    capture_order_id = order.id
+
     attempt = PaymentAttempt(
-        order_id=order.id,
+        order_id=capture_order_id,
         kind="capture",
         status="started",
         paypal_order_id=order.paypal_order_id,
         idempotency_key=idempotency,
     )
     db.add(attempt)
-    db.commit()
 
-    client = PayPalClient(settings)
     try:
-        payload = await client.capture_order(body.paypal_order_id, request_id=idempotency)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+        # Translate the error only if another unresolved capture exists.
+        active_attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == capture_order_id,
+                PaymentAttempt.kind == "capture",
+                PaymentAttempt.status == "started",
+            )
+        )
+
+        if active_attempt is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "paypal_capture_in_progress",
+                    "message": (
+                        "A capture attempt is already in progress or "
+                        "awaiting reconciliation. No new capture was initiated."
+                    ),
+                },
+            )
+
+        # Preserve unrelated integrity errors.
+        raise
+
+    # This must remain outside the IntegrityError handler.
+    client = PayPalClient(settings)
+
+    try:
+        payload = await client.capture_order(
+            body.paypal_order_id,
+            request_id=idempotency,
+        )
+
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        # The capture may have reached PayPal despite the network failure.
+        # Keep the attempt started so a retry must reconcile first.
+        attempt.status = "started"
+        attempt.error_message = (
+            "Capture outcome unknown due to a network error. "
+            "Reconcile with PayPal before retrying."
+        )
+        db.commit()
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "paypal_capture_outcome_unknown",
+                "message": (
+                    "PayPal's capture outcome could not be confirmed. "
+                    "Do not retry until the payment status has been reconciled."
+                ),
+            },
+        ) from exc
+
     except HTTPException:
         attempt.status = "failed"
         order.status = "capture_failed"
         db.commit()
         raise
+
     except PayPalError as exc:
         details = exc.payload.get("details", {})
         issue = ""
+
         if isinstance(details, list) and details:
             issue = str(details[0].get("issue") or "")
         elif isinstance(details, dict):
@@ -259,15 +397,24 @@ async def capture_order(
             try:
                 order_details = await client.get_order(body.paypal_order_id)
                 cap_id = capture_id_from(order_details)
+
                 if order_details.get("status") == "COMPLETED" and cap_id:
                     order.status = "paid"
                     order.paypal_status = "COMPLETED"
                     order.paypal_capture_id = cap_id
                     attempt.status = "succeeded"
+                    attempt.error_message = None
                     db.commit()
                     db.refresh(order)
-                    return {"order": _order_out(order), "duplicate": True, "sandbox": True, "paypal_status": "COMPLETED"}
+
+                    return {
+                        "order": _order_out(order),
+                        "duplicate": True,
+                        "sandbox": True,
+                        "paypal_status": "COMPLETED",
+                    }
             except Exception:
+                # Fall through to the standard PayPal error response.
                 pass
 
         attempt.status = "failed"
@@ -275,27 +422,48 @@ async def capture_order(
         order.status = "capture_failed"
         order.paypal_status = str(issue or "CAPTURE_FAILED")
         db.commit()
-        raise HTTPException(status_code=502, detail={"code": "paypal_capture_failed", "message": exc.message}) from exc
 
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "paypal_capture_failed",
+                "message": exc.message,
+            },
+        ) from exc
 
     status = payload.get("status")
     capture_id = capture_id_from(payload)
     order.paypal_status = status
+
     if status == "COMPLETED" and capture_id:
         order.status = "paid"
         order.paypal_capture_id = capture_id
         attempt.status = "succeeded"
+        attempt.error_message = None
     elif status == "COMPLETED" and not capture_id:
         order.status = "capture_failed"
         attempt.status = "failed"
-        attempt.error_message = "Capture reported COMPLETED without a capture ID."
+        attempt.error_message = (
+            "Capture reported COMPLETED without a capture ID."
+        )
     else:
-        order.status = "approved_not_captured" if status == "APPROVED" else "capture_failed"
+        order.status = (
+            "approved_not_captured"
+            if status == "APPROVED"
+            else "capture_failed"
+        )
         attempt.status = "failed"
         attempt.error_message = f"Unexpected PayPal status: {status}"
+
     db.commit()
     db.refresh(order)
-    return {"order": _order_out(order), "duplicate": False, "sandbox": True, "paypal_status": status}
+
+    return {
+        "order": _order_out(order),
+        "duplicate": False,
+        "sandbox": True,
+        "paypal_status": status,
+    }
 
 
 @router.post("/cancel")
@@ -304,11 +472,41 @@ def cancel_order(
     db: Session = Depends(get_db),
     owner: str = Depends(current_owner),
 ) -> dict:
-    order = db.scalar(select(Order).where(Order.paypal_order_id == body.paypal_order_id))
-    if order is None or order.demo_owner_id != owner or order.session_id != body.session_id:
+    order = db.scalar(
+        select(Order).where(Order.paypal_order_id == body.paypal_order_id)
+    )
+
+    if (
+        order is None
+        or order.demo_owner_id != owner
+        or order.session_id != body.session_id
+    ):
         raise HTTPException(status_code=404, detail="Order not found.")
+
     if order.status == "paid":
-        raise HTTPException(status_code=409, detail="Paid orders cannot be cancelled from this endpoint.")
+        raise HTTPException(
+            status_code=409,
+            detail="Paid orders cannot be cancelled from this endpoint.",
+        )
+
+    capture_in_progress = db.scalar(
+        select(PaymentAttempt.id)
+        .where(
+            PaymentAttempt.order_id == order.id,
+            PaymentAttempt.kind == "capture",
+            PaymentAttempt.status == "started",
+        )
+        .limit(1)
+    )
+
+    if capture_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot cancel while payment capture is in progress.",
+        )
+
     order.status = "cancelled"
     db.commit()
+    db.refresh(order)
+
     return {"order": _order_out(order), "sandbox": True}
