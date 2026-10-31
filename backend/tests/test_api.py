@@ -34,7 +34,7 @@ def test_public_settings(client: TestClient):
     assert body["demo"] is True
     assert body["catalog_currency"] == "INR"
     assert body["paypal_currency"] == "USD"
-    assert body["paypal_inr_per_usd"] == 95.0
+    assert body["paypal_inr_per_usd"] == 83.0
     assert "paypal_client_secret" not in body
     assert "gemini_api_key" not in body
 
