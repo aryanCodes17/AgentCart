@@ -1,36 +1,121 @@
-# AgentCart
+# AgentCart 🛒
 
-Intent-led shopping prototype for the PayPal AI Hackathon.
+**An AI-powered shopping assistant that understands what you need, compares products against your requirements, and supports secure PayPal Sandbox checkout.**
 
-You describe what you need. The backend extracts requirements, searches a **labelled demo catalog**, applies **hard constraints in Python**, and ranks only on verified attributes. Checkout uses **official PayPal REST** (Sandbox) with **server-side prices**. Payment is marked paid only after a verified capture.
+AgentCart turns natural-language shopping requests into structured requirements, filters products using hard constraints, and ranks eligible options using explainable scoring. It also supports product comparison, shopping-session continuity, cart management, and order tracking.
 
-This is not a live store. Catalog prices are demo data. Success is never faked.
+> **Demo project:** AgentCart uses a labelled demo product catalog and PayPal Sandbox. It is not a live e-commerce store. Product prices are demo data, and successful payment status is recorded only after verified PayPal capture.
 
-## What works without extra keys
+## ✨ Features
 
-- Catalog browse and product detail
-- Natural-language search in **rule-based demo mode**
-- Deterministic ranking, compare, and rerank
-- Health flags (`GET /api/health`)
-- Checkout **refuses** to create a PayPal order until Sandbox credentials are set (HTTP 503)
+- **Natural-language shopping:** Describe your needs in plain English instead of relying only on filters.
+- **AI-assisted requirement extraction:** Uses Groq to extract structured shopping requirements, with a labelled rule-based fallback when AI is unavailable.
+- **Hard-constraint filtering:** Disqualifies products that violate requirements such as budget, minimum specifications, or excluded brands before ranking.
+- **Explainable product ranking:** Ranks eligible products using weighted criteria and available product attributes.
+- **Product comparison:** Compare multiple products side by side, including their specifications and trade-offs.
+- **Dynamic reranking:** Adjust ranking priorities and recalculate recommendations.
+- **Shopping sessions:** Maintains session-specific shopping context and order history.
+- **Cart and checkout:** Supports product and cart checkout flows through PayPal Sandbox.
+- **Payment reliability:** Uses server-side product prices, idempotency controls, capture verification, and order reconciliation to handle checkout failures safely.
+- **Order management:** View order status and continue eligible checkout or reconciliation flows.
 
-## Optional live integrations
+## 🧠 How It Works
 
-| Variable | Effect if missing |
+1. **Understand intent** — Extract requirements such as category, budget, preferred specifications, and exclusions.
+2. **Filter candidates** — Apply hard constraints in the backend before calculating recommendation scores.
+3. **Rank products** — Score eligible products using available attributes and configurable weights.
+4. **Explain trade-offs** — Present recommendations with advantages, disadvantages, and missing information rather than inventing specifications.
+5. **Checkout securely** — Create and capture PayPal Sandbox orders using server-side pricing and verified payment status.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    A[User shopping request] --> B[Next.js frontend]
+    B --> C[FastAPI backend]
+    C --> D[Requirement extraction]
+    D --> E[Hard-constraint filtering]
+    E --> F[Explainable ranking]
+    F --> G[Recommendations and comparison]
+    G --> H[Cart and checkout]
+    H --> I[PayPal Sandbox]
+    I --> J[Verified capture]
+    J --> K[Order persistence and history]
+```
+
+## 🛠️ Tech Stack
+
+| Layer | Technologies |
 |---|---|
-| `GEMINI_API_KEY` | Requirement extraction stays rule-based and is labelled as such |
-| `PAYPAL_CLIENT_ID` + `PAYPAL_CLIENT_SECRET` | Create-order returns `paypal_not_configured` |
+| Frontend | Next.js, React, TypeScript, Tailwind CSS |
+| Backend | Python, FastAPI, Pydantic |
+| AI | Groq API, rule-based fallback |
+| Database | SQLite, SQLAlchemy, Alembic |
+| Payments | PayPal REST API — Sandbox |
+| Testing | Pytest |
+| Tooling | Git, GitHub, Postman, Docker Compose |
 
-## Local setup
+## 📁 Project Structure
 
-Requires **Python 3.12** (this repo uses `uv`) and **Node.js 20+**.
+```text
+AgentCart/
+├── backend/
+│   ├── app/
+│   │   ├── routers/
+│   │   ├── services/
+│   │   └── ...
+│   ├── tests/
+│   └── ...
+├── frontend/
+│   ├── app/
+│   ├── components/
+│   └── lib/
+├── docs/
+├── postman/
+├── .env.example
+├── docker-compose.yml
+└── README.md
+```
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Python 3.12
+- Node.js 20+
+- npm
+- [uv](https://docs.astral.sh/uv/) for Python dependency management
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/aryanCodes17/AgentCart.git
+cd AgentCart
+```
+
+### 2. Configure environment variables
 
 ```bash
 copy .env.example .env
-# edit .env — leave PayPal/Gemini blank to run in demo mode
 ```
 
-### Backend
+Edit `.env` and configure the integrations you want to use.
+
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY` | Enables Groq-powered requirement extraction |
+| `AI_PROVIDER` | AI provider selection; configured as `groq` |
+| `PAYPAL_CLIENT_ID` | PayPal Sandbox application client ID |
+| `PAYPAL_CLIENT_SECRET` | PayPal Sandbox application secret |
+| `PAYPAL_BASE_URL` | PayPal Sandbox API base URL |
+| `PAYPAL_INR_PER_USD` | Documented demo INR-to-USD conversion rate |
+| `DATABASE_URL` | Database connection string |
+
+Groq and PayPal credentials are optional for local demo exploration. Without an AI key, the application uses its labelled rule-based fallback. PayPal checkout requires valid Sandbox credentials.
+
+**Never commit your `.env` file or real API credentials.**
+
+### 3. Start the backend
 
 ```bash
 cd backend
@@ -38,10 +123,15 @@ uv sync --group dev
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-API: http://localhost:8000/docs  
-Health: http://localhost:8000/api/health
+Backend API: http://localhost:8000
 
-### Frontend
+Interactive API documentation: http://localhost:8000/docs
+
+Health endpoint: http://localhost:8000/api/health
+
+### 4. Start the frontend
+
+Open another terminal:
 
 ```bash
 cd frontend
@@ -49,34 +139,77 @@ npm install
 npm run dev
 ```
 
-UI: http://localhost:3000
+Frontend: http://localhost:3000
 
-### Tests
+### 5. Run backend tests
 
 ```bash
 cd backend
 uv run pytest -q
 ```
 
-Frontend lint/build: `npm run lint` and `npm run build` in `frontend/`.
+### 6. Build the frontend
 
-### Optional PostgreSQL
-
-`docker-compose.yml` starts Postgres 16. Set `DATABASE_URL` in `.env` to the PostgreSQL URL. SQLite is the default for the local demo.
-
-## PayPal Sandbox
-
-1. Create Sandbox REST credentials in the PayPal Developer dashboard.
-2. Set `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, and `PAYPAL_BASE_URL=https://api-m.sandbox.paypal.com`.
-3. Catalog amounts are INR. Sandbox charges **USD** using `PAYPAL_INR_PER_USD` (documented demo rate, not a live FX feed).
-4. Buyer approval happens on PayPal. AgentCart captures on `/checkout/success` and stores `paid` only with a capture id.
-
-## Project layout
-
-```
-backend/     FastAPI, ranking, AI tools, PayPal client
-frontend/    Next.js App Router
-docs/        Plan and implementation status
+```bash
+cd frontend
+npm run lint
+npm run build
 ```
 
-See [docs/implementation-status.md](docs/implementation-status.md) for the audit, gaps, and milestone log.
+## 💳 PayPal Sandbox Checkout
+
+AgentCart integrates with the official PayPal Checkout REST API.
+
+1. Create a Sandbox REST application in the PayPal Developer Dashboard.
+2. Add the Sandbox client ID and secret to `.env`.
+3. Configure the Sandbox API base URL:
+
+   ```env
+   PAYPAL_BASE_URL=https://api-m.sandbox.paypal.com
+   ```
+
+4. Use a PayPal Sandbox buyer account to approve test payments.
+5. AgentCart verifies the capture response before marking an order as paid.
+
+**Payment safeguards:**
+- Prices are retrieved from backend catalog data, not trusted from the client.
+- Checkout requests use idempotency keys to reduce duplicate order creation.
+- Capture attempts are guarded against duplicate processing.
+- Ambiguous payment outcomes can be reconciled against PayPal.
+- An order is marked paid only after a completed capture with a valid capture ID.
+
+Catalog prices are in INR, while the Sandbox payment flow uses USD. The configured conversion rate is a documented demo rate, not a live foreign-exchange feed.
+
+## 🔌 API Overview
+
+The backend exposes endpoints for:
+
+- Health and public application settings
+- Product catalog and product details
+- AI-assisted shopping search and follow-up messages
+- Product comparison and reranking
+- Shopping sessions and recommendations
+- PayPal order creation, capture, and cancellation
+- Order history, order details, and reconciliation
+
+Explore the complete request and response schemas at:
+
+`http://localhost:8000/docs`
+
+## ⚠️ Important Notes
+
+- The product catalog is demo data.
+- Product recommendations are limited by the attributes available in the catalog.
+- Missing specifications are treated as unknown, not guessed.
+- PayPal integration runs in Sandbox mode; no real payments are processed.
+- The configured currency conversion is for demonstration only.
+
+## 👨‍💻 Author
+
+**Aman Aryan**
+
+[GitHub](https://github.com/aryanCodes17) · [Project Repository](https://github.com/aryanCodes17/AgentCart)
+
+---
+
+*Built as an AI-powered shopping agent project exploring intent understanding, explainable recommendations, and reliable payment workflows.*
