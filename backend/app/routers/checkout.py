@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 import httpx
-
+from datetime import datetime, timezone, timedelta
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.deps import current_owner
@@ -63,6 +63,7 @@ def _order_out(order: Order) -> OrderOut:
     )
 
 
+
 @router.post("/create-order")
 async def create_order(
     body: CreateOrderRequest,
@@ -74,7 +75,6 @@ async def create_order(
     if session is None or session.demo_owner_id != owner:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    # Support multi-item carts and legacy single-product requests.
     requested_items = (
         [(item.product_id, item.quantity) for item in body.items]
         if body.items
@@ -84,7 +84,6 @@ async def create_order(
     products_and_quantities = []
     total_inr = 0.0
 
-    # Validate products and calculate the total on the server.
     for product_id, quantity in requested_items:
         product = db.get(Product, product_id)
 
@@ -109,44 +108,181 @@ async def create_order(
         settings.paypal_inr_per_usd,
     )
 
-    # Preserve product_id for compatibility with existing orders/API.
     first_product = products_and_quantities[0][0]
 
-    order = Order(
-        session_id=session.id,
-        demo_owner_id=owner,
-        product_id=first_product.id,
-        status="pending_approval",
-        amount_inr=total_inr,
-        currency="INR",
-        paypal_amount=float(paypal_amount),
-        paypal_currency=settings.paypal_currency,
-        fx_rate_inr_per_usd=settings.paypal_inr_per_usd,
-        idempotency_key=f"create-{new_id()}",
+    # Look up a previous attempt using the client-supplied key.
+    order = db.scalar(
+        select(Order).where(
+            Order.idempotency_key == body.idempotency_key
+        )
     )
-    db.add(order)
-    db.flush()
 
-    # Save each cart line against the parent order.
-    for product, quantity in products_and_quantities:
-        db.add(
-            OrderItem(
-                order_id=order.id,
-                product_id=product.id,
-                quantity=quantity,
-                unit_price_inr=product.price_inr,
+    if order is not None:
+        # Never allow a key to be reused for another user's order,
+        # session, or cart.
+        existing_items = {
+            item.product_id: item.quantity for item in order.items
+        }
+        requested_map = dict(requested_items)
+
+        if (
+            order.demo_owner_id != owner
+            or order.session_id != body.session_id
+            or existing_items != requested_map
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_key_conflict",
+                    "message": (
+                        "This idempotency key belongs to a different "
+                        "checkout request. Start a new checkout."
+                    ),
+                },
+            )
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == order.id,
+                PaymentAttempt.kind == "create",
             )
         )
 
-    attempt = PaymentAttempt(
-        order_id=order.id,
-        kind="create",
-        status="started",
-        idempotency_key=order.idempotency_key,
-    )
-    db.add(attempt)
+        if attempt is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The previous checkout attempt requires investigation.",
+            )
+
+        # A completed creation can safely return the original approval URL.
+        if order.status == "checkout_unavailable":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "checkout_unavailable",
+                    "message": (
+                        "This PayPal checkout is no longer available. "
+                        "Start a new checkout with a new idempotency key."
+                    ),
+                },
+            )
+        if order.status == "checkout_unavailable":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "checkout_unavailable",
+                    "message": (
+                        "This PayPal checkout is no longer available. "
+                        "Start a new checkout with a new idempotency key."
+                    ),
+                },
+            )
+        if (
+            attempt.status == "succeeded"
+            and order.paypal_order_id
+            and order.approval_url
+        ):
+            return {
+                "order": _order_out(order),
+                "approval_url": order.approval_url,
+                "sandbox": True,
+                "duplicate": True,
+                "pricing_note": "Reused existing PayPal checkout.",
+            }
+
+        if attempt.status == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "previous_checkout_failed",
+                    "message": (
+                        "The previous checkout failed. Start a new "
+                        "checkout with a new idempotency key."
+                    ),
+                },
+            )
+
+        # PayPal Orders v2 idempotency retention is six hours by default.
+        created_at = attempt.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+
+        if datetime.now(timezone.utc) - created_at > timedelta(hours=6):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "checkout_reconciliation_required",
+                    "message": (
+                        "The previous PayPal creation attempt is too old "
+                        "to retry safely. Verify its outcome before "
+                        "starting another checkout."
+                    ),
+                },
+            )
+
+    else:
+        # Create and persist the local order BEFORE contacting PayPal.
+        order = Order(
+            session_id=session.id,
+            demo_owner_id=owner,
+            product_id=first_product.id,
+            status="pending_approval",
+            amount_inr=total_inr,
+            currency="INR",
+            paypal_amount=float(paypal_amount),
+            paypal_currency=settings.paypal_currency,
+            fx_rate_inr_per_usd=settings.paypal_inr_per_usd,
+            idempotency_key=body.idempotency_key,
+        )
+        db.add(order)
+        db.flush()
+
+        for product, quantity in products_and_quantities:
+            db.add(
+                OrderItem(
+                    order_id=order.id,
+                    product_id=product.id,
+                    quantity=quantity,
+                    unit_price_inr=product.price_inr,
+                )
+            )
+
+        attempt = PaymentAttempt(
+            order_id=order.id,
+            kind="create",
+            status="started",
+            idempotency_key=body.idempotency_key,
+        )
+        db.add(attempt)
+
+        try:
+            db.commit()
+            db.refresh(order)
+        except IntegrityError:
+            db.rollback()
+
+            # Another concurrent request may have created this key first.
+            order = db.scalar(
+                select(Order).where(
+                    Order.idempotency_key == body.idempotency_key
+                )
+            )
+            if order is None:
+                raise
+
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "checkout_already_started",
+                    "message": (
+                        "This checkout is already being processed. "
+                        "Retry using the same idempotency key."
+                    ),
+                },
+            )
 
     client = PayPalClient(settings)
+
     return_url = (
         f"{settings.public_frontend_url}/checkout/success"
         f"?order_id={order.id}"
@@ -158,51 +294,107 @@ async def create_order(
 
     try:
         paypal_order = await client.create_order(
-            amount=paypal_amount,
-            currency=settings.paypal_currency,
-            description=f"AgentCart cart ({len(products_and_quantities)} lines)",
+            amount=order.paypal_amount,
+            currency=order.paypal_currency,
+            description=f"AgentCart cart ({len(requested_items)} lines)",
             custom_id=order.id,
             return_url=return_url,
             cancel_url=cancel_url,
             request_id=order.idempotency_key,
         )
+
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        # PayPal may have created the order despite the network failure.
+        # Keep the attempt started and retry only with the same request ID.
+        attempt.status = "started"
+        attempt.error_message = (
+            "PayPal creation outcome unknown due to a network error."
+        )
+        db.commit()
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "paypal_create_outcome_unknown",
+                "message": (
+                    "PayPal's order creation outcome could not be confirmed. "
+                    "Retry this checkout using the same idempotency key."
+                ),
+            },
+        ) from exc
+
     except HTTPException as exc:
         attempt.status = "failed"
         attempt.error_message = str(exc.detail)
         order.status = "capture_failed"
         db.commit()
         raise
+
+
     except PayPalError as exc:
-        attempt.status = "failed"
         attempt.http_status = exc.status_code
         attempt.error_message = exc.message
+
+        # Retryable or ambiguous errors must preserve the started attempt.
+        if exc.status_code in (408, 429) or exc.status_code >= 500:
+            attempt.status = "started"
+            order.status = "pending"
+            db.commit()
+
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "paypal_create_outcome_unknown",
+                    "message": (
+                        "PayPal returned a retryable or ambiguous error. "
+                        "Retry using the same idempotency key."
+                    ),
+                    "paypal_http_status": exc.status_code,
+                },
+            ) from exc
+
+        # Definite client-side rejection.
+        attempt.status = "failed"
         order.status = "capture_failed"
         db.commit()
+
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "paypal_error",
                 "message": exc.message,
+                "paypal_http_status": exc.status_code,
                 "paypal": exc.payload,
             },
         ) from exc
-
+    # Save any returned PayPal ID even if the response is incomplete.
     order.paypal_order_id = paypal_order.get("id")
     order.paypal_status = paypal_order.get("status")
     order.approval_url = approval_url_from(paypal_order)
 
-    if not order.approval_url:
-        attempt.status = "failed"
-        attempt.error_message = "PayPal response did not include an approval URL."
-        order.status = "capture_failed"
+    if not order.paypal_order_id or not order.approval_url:
+        # Do not mark this failed: PayPal may already have created an order.
+        attempt.status = "started"
+        attempt.error_message = (
+            "PayPal returned an incomplete creation response."
+        )
         db.commit()
+
         raise HTTPException(
             status_code=502,
-            detail="PayPal did not return an approval link.",
+            detail={
+                "code": "paypal_create_response_incomplete",
+                "message": (
+                    "PayPal returned an incomplete response. "
+                    "Retry with the same idempotency key."
+                ),
+            },
         )
 
     attempt.status = "succeeded"
     attempt.paypal_order_id = order.paypal_order_id
+    attempt.error_message = None
+
     db.commit()
     db.refresh(order)
 
@@ -210,6 +402,7 @@ async def create_order(
         "order": _order_out(order),
         "approval_url": order.approval_url,
         "sandbox": True,
+        "duplicate": False,
         "pricing_note": (
             f"Cart total ₹{total_inr:,.2f} INR. Sandbox charge "
             f"{settings.paypal_currency} {paypal_amount:.2f} using documented "
@@ -217,6 +410,7 @@ async def create_order(
             "This is not a live FX quote."
         ),
     }
+
 
 
 @router.post("/capture-order")
@@ -385,14 +579,20 @@ async def capture_order(
         raise
 
     except PayPalError as exc:
-        details = exc.payload.get("details", {})
+        attempt.http_status = exc.status_code
+        attempt.error_message = exc.message
+
+        details = (exc.payload or {}).get("details", {})
         issue = ""
 
         if isinstance(details, list) and details:
-            issue = str(details[0].get("issue") or "")
+            if isinstance(details[0], dict):
+                issue = str(details[0].get("issue") or "")
         elif isinstance(details, dict):
             issue = str(details.get("issue") or details.get("name") or "")
 
+        # PayPal says the order may already have been captured.
+        # Verify its actual status before marking the order paid.
         if issue == "ORDER_ALREADY_CAPTURED":
             try:
                 order_details = await client.get_order(body.paypal_order_id)
@@ -413,12 +613,50 @@ async def capture_order(
                         "sandbox": True,
                         "paypal_status": "COMPLETED",
                     }
-            except Exception:
-                # Fall through to the standard PayPal error response.
-                pass
 
+            except Exception as reconcile_exc:
+                attempt.error_message = (
+                    "PayPal reported ORDER_ALREADY_CAPTURED, "
+                    f"but reconciliation failed: {str(reconcile_exc)}"
+                )
+
+            # Never mark the attempt failed when payment status is uncertain.
+            attempt.status = "started"
+            order.paypal_status = "RECONCILIATION_REQUIRED"
+            db.commit()
+
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "paypal_capture_reconciliation_required",
+                    "message": (
+                        "PayPal indicates this order may already be captured, "
+                        "but its final payment status could not be verified. "
+                        "Do not start another capture."
+                    ),
+                },
+            ) from exc
+
+        # Ambiguous errors: preserve the started attempt.
+        if exc.status_code in (408, 429) or exc.status_code >= 500:
+            attempt.status = "started"
+            db.commit()
+
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "paypal_capture_outcome_unknown",
+                    "message": (
+                        "PayPal returned an ambiguous capture error. "
+                        "The payment may have completed. "
+                        "Reconcile the payment before retrying."
+                    ),
+                    "paypal_http_status": exc.status_code,
+                },
+            ) from exc
+
+        # Definite client-side rejection.
         attempt.status = "failed"
-        attempt.error_message = exc.message
         order.status = "capture_failed"
         order.paypal_status = str(issue or "CAPTURE_FAILED")
         db.commit()
@@ -428,6 +666,7 @@ async def capture_order(
             detail={
                 "code": "paypal_capture_failed",
                 "message": exc.message,
+                "paypal_http_status": exc.status_code,
             },
         ) from exc
 

@@ -47,3 +47,6 @@ backend/.venv/
 # Nested Git metadata backups
 /backend-git-metadata-backup/
 /frontend-git-metadata-backup/
+
+# Backup files
+*.bak

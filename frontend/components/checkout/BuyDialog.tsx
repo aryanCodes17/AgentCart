@@ -3,7 +3,13 @@
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
-import { rememberCheckout, setShopSessionId, getShopSessionId } from "@/lib/session";
+import {
+  rememberCheckout,
+  setShopSessionId,
+  getShopSessionId,
+  getOrCreateCheckoutKey,
+  clearCheckoutKey,
+} from "@/lib/session";
 import { formatInr } from "@/lib/utils";
 import { useState } from "react";
 
@@ -26,30 +32,50 @@ export function BuyDialog({
   if (!open) return null;
 
   async function confirm() {
-    setBusy(true);
-    setError(null);
-    try {
-      let sessionId = getShopSessionId();
-      if (!sessionId) {
-        const created = await api.createSession();
-        sessionId = created.id;
-        setShopSessionId(sessionId);
-      }
-      const result = await api.createOrder(productId, sessionId);
-      if (!result.approval_url) {
-        throw new Error("PayPal did not return an approval URL.");
-      }
-      rememberCheckout({
-        orderId: result.order.id,
-        paypalOrderId: result.order.paypal_order_id || "",
-        sessionId,
-      });
-      window.location.assign(result.approval_url);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not start PayPal checkout.");
-      setBusy(false);
+  setBusy(true);
+  setError(null);
+
+  let checkoutIntent: string | null = null;
+
+  try {
+    let sessionId = getShopSessionId();
+
+    if (!sessionId) {
+      const created = await api.createSession();
+      sessionId = created.id;
+      setShopSessionId(sessionId);
     }
+
+    checkoutIntent = `product:${sessionId}:${productId}`;
+    const idempotencyKey = getOrCreateCheckoutKey(checkoutIntent);
+
+    const result = await api.createOrder(
+      productId,
+      sessionId,
+      idempotencyKey,
+    );
+
+    if (!result.approval_url) {
+      throw new Error("PayPal did not return an approval URL.");
+    }
+
+    rememberCheckout({
+      orderId: result.order.id,
+      paypalOrderId: result.order.paypal_order_id || "",
+      sessionId,
+    });
+
+    clearCheckoutKey(checkoutIntent);
+    window.location.assign(result.approval_url);
+  } catch (err) {
+    setError(
+      err instanceof Error
+        ? err.message
+        : "Could not start PayPal checkout.",
+    );
+    setBusy(false);
   }
+}
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 sm:items-center">

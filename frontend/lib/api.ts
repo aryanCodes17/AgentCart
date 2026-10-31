@@ -60,20 +60,45 @@ export const api = {
   sessions: () => request<{ items: { id: string; title: string; status: string }[] }>("/api/sessions"),
   session: (id: string) => request<{ id: string; title: string; messages: { role: string; content: string }[]; requirement: unknown }>
     (`/api/sessions/${id}`),
-  createOrder: (productId: string, sessionId: string) =>
-    request<{ order: Order; approval_url: string; pricing_note: string; sandbox: boolean }>(
-      "/api/checkout/create-order",
-      { method: "POST", body: JSON.stringify({ product_id: productId, session_id: sessionId }) },
-    ),
-    
-    createCartOrder: (items: { product_id: string; quantity: number }[], sessionId: string) =>
-      request<{ order: Order; approval_url: string; pricing_note: string; sandbox: boolean }>(
-        "/api/checkout/create-order",
-        {
-          method: "POST",
-          body: JSON.stringify({ items, session_id: sessionId }),
-        },
-      ),
+    createOrder: (
+      productId: string,
+      sessionId: string,
+      idempotencyKey: string,
+    ) =>
+      request<{
+        order: Order;
+        approval_url: string;
+        pricing_note: string;
+        sandbox: boolean;
+        duplicate?: boolean;
+      }>("/api/checkout/create-order", {
+        method: "POST",
+        body: JSON.stringify({
+          product_id: productId,
+          session_id: sessionId,
+          idempotency_key: idempotencyKey,
+        }),
+      }),
+
+    createCartOrder: (
+      items: { product_id: string; quantity: number }[],
+      sessionId: string,
+      idempotencyKey: string,
+    ) =>
+      request<{
+        order: Order;
+        approval_url: string;
+        pricing_note: string;
+        sandbox: boolean;
+        duplicate?: boolean;
+      }>("/api/checkout/create-order", {
+        method: "POST",
+        body: JSON.stringify({
+          items,
+          session_id: sessionId,
+          idempotency_key: idempotencyKey,
+        }),
+      }),
 
   captureOrder: (paypalOrderId: string, sessionId: string) =>
     request<{ order: Order; duplicate: boolean }>("/api/checkout/capture-order", {
@@ -85,8 +110,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ paypal_order_id: paypalOrderId, session_id: sessionId }),
     }),
-  orders: () => request<{ items: Order[]; sandbox: boolean }>("/api/orders"),
-  order: (id: string) => request<{ order: Order; sandbox: boolean }>(`/api/orders/${id}`),
+    orders: () => request<{ items: Order[]; sandbox: boolean }>("/api/orders"),
+    order: (id: string) => request<{ order: Order; sandbox: boolean }>(`/api/orders/${id}`),
+
+  // Verify PayPal payment without initiating another capture
+  reconcileOrder: (id: string) =>
+    request<{
+      order: Order;
+      reconciliation: "already_paid" | "paid" | "unresolved";
+      paypal_status?: string | null;
+      message?: string;
+      sandbox: boolean;
+    }>(`/api/orders/${id}/reconcile`, {
+      method: "POST",
+    }),
 };
 
 export const EXAMPLES = [

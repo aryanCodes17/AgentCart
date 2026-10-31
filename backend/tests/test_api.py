@@ -81,7 +81,11 @@ def test_checkout_rejects_missing_paypal_config(client: TestClient):
     response = client.post(
         "/api/checkout/create-order",
         headers=HEADERS,
-        json={"product_id": product_id, "session_id": session_id, "amount": 1},
+        json={
+            "product_id": product_id,
+            "session_id": session_id,
+            "idempotency_key": str(uuid.uuid4()),
+        },
     )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "paypal_not_configured"
@@ -160,7 +164,7 @@ def test_checkout_cancel_rejected_while_capture_is_in_progress(client: TestClien
         "/api/checkout/cancel",
         headers=HEADERS,
         json={
-            "paypal_order_id":paypal_order_id,
+            "paypal_order_id": paypal_order_id,
             "session_id": session_id,
         },
     )
@@ -640,3 +644,447 @@ def test_checkout_reconciliation_keeps_capture_blocked_when_paypal_unreachable(
         )
         assert attempt is not None
         assert attempt.status == "started"
+
+
+@pytest.mark.parametrize(
+    ("paypal_status", "expected_attempt_status", "expected_order_status", "expected_code"),
+    [
+        (400, "failed", "capture_failed", "paypal_error"),
+        (429, "started", "pending", "paypal_create_outcome_unknown"),
+        (500, "started", "pending", "paypal_create_outcome_unknown"),
+        (503, "started", "pending", "paypal_create_outcome_unknown"),
+    ],
+)
+def test_checkout_create_paypal_error_states(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    paypal_status: int,
+    expected_attempt_status: str,
+    expected_order_status: str,
+    expected_code: str,
+):
+    from app.routers import checkout as checkout_router
+    from app.services.paypal import PayPalError
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    product_id = products_response.json()["items"][0]["id"]
+
+    idempotency_key = str(uuid.uuid4())
+
+    class FailingPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def create_order(self, **kwargs):
+            raise PayPalError(
+                "Simulated PayPal failure",
+                status_code=paypal_status,
+                payload={"status": paypal_status},
+            )
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", FailingPayPalClient
+    )
+
+    response = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json={
+            "product_id": product_id,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == expected_code
+
+    with SessionLocal() as db:
+        order = db.scalar(
+            select(Order).where(Order.idempotency_key == idempotency_key)
+        )
+        assert order is not None
+        assert order.status == expected_order_status
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == order.id,
+                PaymentAttempt.kind == "create",
+            )
+        )
+        assert attempt is not None
+        assert attempt.status == expected_attempt_status
+        assert attempt.http_status == paypal_status
+
+
+def test_checkout_create_order_same_key_returns_existing_order(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.routers import checkout as checkout_router
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    product_id = products_response.json()["items"][0]["id"]
+
+    idempotency_key = str(uuid.uuid4())
+    paypal_calls = []
+
+    class SuccessfulPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def create_order(self, **kwargs):
+            paypal_calls.append(kwargs["request_id"])
+            return {
+                "id": "TEST-PAYPAL-" + idempotency_key[:12],
+                "status": "CREATED",
+                "links": [
+                    {
+                        "rel": "approve",
+                        "href": "https://example.com/approve",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", SuccessfulPayPalClient
+    )
+
+    payload = {
+        "product_id": product_id,
+        "session_id": session_id,
+        "idempotency_key": idempotency_key,
+    }
+
+    first = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json=payload,
+    )
+
+    second = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+
+    assert first.json()["order"]["id"] == second.json()["order"]["id"]
+    assert len(paypal_calls) == 1
+    assert paypal_calls[0] == idempotency_key
+
+    with SessionLocal() as db:
+        orders = db.scalars(
+            select(Order).where(Order.idempotency_key == idempotency_key)
+        ).all()
+
+        assert len(orders) == 1
+
+
+def test_checkout_create_order_rejects_same_key_with_different_product(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.routers import checkout as checkout_router
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    products = products_response.json()["items"]
+
+    assert len(products) >= 2
+
+    first_product_id = products[0]["id"]
+    second_product_id = products[1]["id"]
+
+    idempotency_key = str(uuid.uuid4())
+
+    class SuccessfulPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def create_order(self, **kwargs):
+            return {
+                "id": "TEST-PAYPAL-" + idempotency_key[:12],
+                "status": "CREATED",
+                "links": [
+                    {
+                        "rel": "approve",
+                        "href": "https://example.com/approve",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        checkout_router, "PayPalClient", SuccessfulPayPalClient
+    )
+
+    first = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json={
+            "product_id": first_product_id,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json={
+            "product_id": second_product_id,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "idempotency_key_conflict"
+
+
+def test_checkout_create_timeout_then_retry_reuses_same_key(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import httpx
+    from app.routers import checkout as checkout_router
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    assert session_response.status_code == 200
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    assert products_response.status_code == 200
+    product_id = products_response.json()["items"][0]["id"]
+
+    idempotency_key = str(uuid.uuid4())
+    paypal_calls = []
+
+    class TimeoutThenSuccessPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def create_order(self, **kwargs):
+            paypal_calls.append(kwargs["request_id"])
+
+            if len(paypal_calls) == 1:
+                raise httpx.ReadTimeout("Simulated PayPal timeout")
+
+            return {
+                "id": "TEST-RETRY-" + idempotency_key[:12],
+                "status": "CREATED",
+                "links": [
+                    {
+                        "rel": "approve",
+                        "href": "https://example.com/approve",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        checkout_router,
+        "PayPalClient",
+        TimeoutThenSuccessPayPalClient,
+    )
+
+    payload = {
+        "product_id": product_id,
+        "session_id": session_id,
+        "idempotency_key": idempotency_key,
+    }
+
+    # First request: PayPal times out.
+    first = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json=payload,
+    )
+
+    assert first.status_code == 502
+    assert (
+        first.json()["detail"]["code"]
+        == "paypal_create_outcome_unknown"
+    )
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(
+                Order.idempotency_key == idempotency_key
+            )
+        )
+
+        assert saved_order is not None
+        original_order_id = saved_order.id
+        assert saved_order.status != "capture_failed"
+
+        attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "create",
+            )
+        )
+
+        assert attempt is not None
+        assert attempt.status == "started"
+
+    # Second request: retry with exactly the same key and payload.
+    second = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json=payload,
+    )
+
+    assert second.status_code == 200
+    assert second.json()["order"]["id"] == original_order_id
+    assert (
+        second.json()["order"]["paypal_order_id"]
+        == "TEST-RETRY-" + idempotency_key[:12]
+    )
+    assert second.json()["approval_url"] == "https://example.com/approve"
+
+    # Both PayPal calls must use the same request ID.
+    assert paypal_calls == [idempotency_key, idempotency_key]
+
+    with SessionLocal() as db:
+        orders = db.scalars(
+            select(Order).where(
+                Order.idempotency_key == idempotency_key
+            )
+        ).all()
+
+        assert len(orders) == 1
+
+        attempts = db.scalars(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == original_order_id,
+                PaymentAttempt.kind == "create",
+            )
+        ).all()
+
+        assert len(attempts) == 1
+        assert attempts[0].status == "succeeded"
+
+
+def test_checkout_stale_create_attempt_requires_reconciliation(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from datetime import datetime, timezone, timedelta
+    from app.routers import checkout as checkout_router
+
+    session_response = client.post("/api/sessions", headers=HEADERS)
+    session_id = session_response.json()["id"]
+
+    products_response = client.get("/api/products", headers=HEADERS)
+    product_id = products_response.json()["items"][0]["id"]
+
+    idempotency_key = str(uuid.uuid4())
+
+    # Create an existing order and a stale started attempt.
+    with SessionLocal() as db:
+        product = db.get(
+            __import__("app.models", fromlist=["Product"]).Product,
+            product_id,
+        )
+
+        order = Order(
+            session_id=session_id,
+            demo_owner_id=HEADERS["X-Demo-Session"],
+            product_id=product_id,
+            status="pending",
+            amount_inr=product.price_inr,
+            currency="INR",
+            paypal_amount=10.0,
+            paypal_currency="USD",
+            fx_rate_inr_per_usd=95.0,
+            idempotency_key=idempotency_key,
+        )
+        db.add(order)
+        db.flush()
+
+        from app.models import OrderItem
+
+        db.add(
+            OrderItem(
+                order_id=order.id,
+                product_id=product_id,
+                quantity=1,
+                unit_price_inr=product.price_inr,
+            )
+        )
+        db.flush()
+        attempt = PaymentAttempt(
+            order_id=order.id,
+            kind="create",
+            status="started",
+            idempotency_key=idempotency_key,
+        )
+        db.add(attempt)
+        db.commit()
+
+        attempt.created_at = datetime.now(timezone.utc) - timedelta(hours=7)
+        db.commit()
+
+    paypal_calls = []
+
+    class ShouldNotCallPayPalClient:
+        def __init__(self, settings):
+            pass
+
+        async def create_order(self, **kwargs):
+            paypal_calls.append(kwargs)
+            raise AssertionError("PayPal must not be called for stale attempts")
+
+    monkeypatch.setattr(
+        checkout_router,
+        "PayPalClient",
+        ShouldNotCallPayPalClient,
+    )
+
+    response = client.post(
+        "/api/checkout/create-order",
+        headers=HEADERS,
+        json={
+            "product_id": product_id,
+            "session_id": session_id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]["code"]
+        == "checkout_reconciliation_required"
+    )
+    assert paypal_calls == []
+
+    with SessionLocal() as db:
+        saved_order = db.scalar(
+            select(Order).where(Order.idempotency_key == idempotency_key)
+        )
+        assert saved_order is not None
+
+        saved_attempt = db.scalar(
+            select(PaymentAttempt).where(
+                PaymentAttempt.order_id == saved_order.id,
+                PaymentAttempt.kind == "create",
+            )
+        )
+        assert saved_attempt is not None
+        assert saved_attempt.status == "started"

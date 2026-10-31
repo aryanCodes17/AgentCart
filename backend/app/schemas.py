@@ -147,6 +147,7 @@ class CartItemRequest(BaseModel):
 
 class CreateOrderRequest(BaseModel):
     session_id: str
+    idempotency_key: str = Field(min_length=36, max_length=80)
     items: list[CartItemRequest] = Field(default_factory=list, max_length=50)
     product_id: str | None = None
 

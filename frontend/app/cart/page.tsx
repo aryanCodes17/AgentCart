@@ -1,16 +1,17 @@
 
 "use client";
-
+import {
+  getShopSessionId,
+  setShopSessionId,
+  rememberCheckout,
+  getOrCreateCheckoutKey,
+  clearCheckoutKey,
+} from "@/lib/session";
 import { PageShell } from "@/components/layout/PageShell";
 import { Button, ButtonLink } from "@/components/ui/button";
 import { useCart } from "@/lib/cart";
 import { formatInr } from "@/lib/utils";
 import { api } from "@/lib/api";
-import {
-  getShopSessionId,
-  setShopSessionId,
-  rememberCheckout,
-} from "@/lib/session";
 import { useState } from "react";
 
 export default function CartPage() {
@@ -29,6 +30,8 @@ async function handleCheckout() {
   setCheckoutBusy(true);
   setCheckoutError(null);
 
+  let checkoutIntent: string | null = null;
+
   try {
     let sessionId = getShopSessionId();
 
@@ -38,12 +41,21 @@ async function handleCheckout() {
       setShopSessionId(sessionId);
     }
 
-    const result = await api.createCartOrder(
-      items.map(({ product, quantity }) => ({
+    const checkoutItems = items
+      .map(({ product, quantity }) => ({
         product_id: product.id,
         quantity,
-      })),
+      }))
+      .sort((a, b) => a.product_id.localeCompare(b.product_id));
+
+    checkoutIntent = `cart:${sessionId}:${JSON.stringify(checkoutItems)}`;
+
+    const idempotencyKey = getOrCreateCheckoutKey(checkoutIntent);
+
+    const result = await api.createCartOrder(
+      checkoutItems,
       sessionId,
+      idempotencyKey,
     );
 
     if (!result.approval_url) {
@@ -56,6 +68,7 @@ async function handleCheckout() {
       sessionId,
     });
 
+    clearCheckoutKey(checkoutIntent);
     window.location.assign(result.approval_url);
   } catch (err) {
     setCheckoutError(

@@ -75,6 +75,11 @@ export type RankingResponse = {
 export type Order = {
   id: string;
   product: Product;
+  items: {
+    product: Product;
+    quantity: number;
+    unit_price_inr: number;
+  }[];
   status: string;
   amount_inr: number;
   currency: string;

@@ -280,9 +280,6 @@ function ShopInner() {
               </form>
             </aside>
             <div>
-              <Alert tone={ranking.mode === "ai" ? "info" : "warn"} title={ranking.mode === "ai" ? "AI extraction" : "Rule-based demo mode"}>
-                {ranking.tradeoff_summary}
-              </Alert>
               <p className="mt-4 text-sm text-[var(--ink-muted)]">
                 {ranking.eligible_count} eligible · {ranking.excluded_count} excluded · {ranking.evaluated_count} evaluated
               </p>

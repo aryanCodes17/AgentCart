@@ -52,16 +52,51 @@ function CheckoutInner() {
           return;
         }
 
-        const captureId = fetched.order.paypal_order_id || paypalOrderId;
-        if (!captureId || !sessionId) {
-          setStatus("error");
-          setMessage(
-            "This order is still pending. Capture needs the PayPal order id and the demo shopping session from the browser that started checkout.",
-          );
-          return;
-        }
+        // Opening an order-status page must never initiate payment capture.
+      if (!token) {
+        setStatus("pending");
+        setMessage(
+          "Payment has not been verified on this page. Return from PayPal to complete payment verification.",
+        );
+        return;
+      }
 
-        const captured = await api.captureOrder(captureId, sessionId);
+      // Ensure the PayPal return token belongs to this local order.
+      if (fetched.order.paypal_order_id !== token) {
+        setStatus("error");
+        setMessage(
+          "The PayPal return token does not match this order. Payment was not captured.",
+        );
+        return;
+      }
+
+      if (!sessionId) {
+        setStatus("error");
+        setMessage(
+          "The shopping session is unavailable. Payment verification cannot continue.",
+        );
+        return;
+      }
+
+      const captured = await api.captureOrder(token, sessionId);
+      setOrder(captured.order);
+
+      if (
+        captured.order.status === "paid" &&
+        captured.order.paypal_capture_id
+      ) {
+        setStatus("paid");
+        setMessage(
+          captured.duplicate
+            ? "Payment was already captured and verified."
+            : "PayPal capture completed successfully.",
+        );
+      } else {
+        setStatus("error");
+        setMessage(
+          `Capture did not complete. Server status: ${captured.order.status}.`,
+        );
+      }
         setOrder(captured.order);
         if (captured.order.status === "paid" && captured.order.paypal_capture_id) {
           setStatus("paid");

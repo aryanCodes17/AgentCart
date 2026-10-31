@@ -71,7 +71,7 @@ class PayPalClient:
         if response.status_code >= 400:
             raise PayPalError(
                 "PayPal authentication failed. Check Sandbox client ID and secret.",
-                status_code=502,
+                status_code=response.status_code,
                 payload={"status": response.status_code},
             )
         data = response.json()
@@ -129,7 +129,7 @@ class PayPalClient:
         if response.status_code >= 400:
             raise PayPalError(
                 "PayPal create-order failed.",
-                status_code=502,
+                status_code=response.status_code,
                 payload={"status": response.status_code, "details": _redacted(data)},
             )
         return data
@@ -150,7 +150,7 @@ class PayPalClient:
         if response.status_code >= 400:
             raise PayPalError(
                 "PayPal capture failed.",
-                status_code=502,
+                status_code=response.status_code,
                 payload={"status": response.status_code, "details": _redacted(data)},
             )
         return data
@@ -164,7 +164,14 @@ class PayPalClient:
         )
         data = _safe_json(response)
         if response.status_code >= 400:
-            raise PayPalError("PayPal get-order failed.", payload={"status": response.status_code})
+            raise PayPalError(
+                "PayPal get-order failed.",
+                status_code=response.status_code,
+                payload={
+                    "status": response.status_code,
+                    "details": _redacted(data),
+                },
+            )
         return data
 
 
