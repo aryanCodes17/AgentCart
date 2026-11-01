@@ -20,7 +20,9 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    if settings.app_env != "production":
+        Base.metadata.create_all(bind=engine)
+
     db = SessionLocal()
     try:
         added = seed_products(db)
